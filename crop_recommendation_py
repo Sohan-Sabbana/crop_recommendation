@@ -1,0 +1,396 @@
+# crop_recommendation_final.py
+# Single-file runnable script / notebook cell.
+# Purpose: load crop dataset CSV (from ./data/ or upload in Colab),
+# train multiple classifiers, evaluate, choose best, tune, show metrics, save model.
+# Run in Colab/Jupyter or as a script (some upload bits will only run in Colab).
+
+import os
+import sys
+import warnings
+warnings.filterwarnings("ignore")
+print("Python", sys.version)
+
+# --------------------------
+# 0) Install dependencies if missing (will work in Colab/Jupyter)
+# --------------------------
+try:
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.svm import SVC
+    import xgboost as xgb
+    import lightgbm as lgb
+    import joblib
+    import shap
+except Exception:
+    # Try installing common packages (non-blocking if already present)
+    print("Installing missing packages...")
+    !pip install -q pandas numpy scikit-learn xgboost lightgbm shap matplotlib seaborn joblib
+    import pandas as pd
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score, GridSearchCV
+    from sklearn.preprocessing import StandardScaler, LabelEncoder
+    from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, roc_auc_score
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.svm import SVC
+    import xgboost as xgb
+    import lightgbm as lgb
+    import joblib
+    import shap
+
+# --------------------------
+# Helper: detect environment (Colab) and CSV file
+# --------------------------
+def in_colab():
+    try:
+        import google.colab  # type: ignore
+        return True
+    except Exception:
+        return False
+
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+def find_csv():
+    candidates = []
+    for root, _, files in os.walk(DATA_DIR):
+        for f in files:
+            if f.lower().endswith(".csv"):
+                candidates.append(os.path.join(root, f))
+    return sorted(candidates)
+
+csvs = find_csv()
+
+# If running in Colab and no CSV found, offer upload widget
+if in_colab() and not csvs:
+    print("No CSV found in ./data/. Running upload widget (Colab). Please upload your CSV (e.g. Crop_recommendation.csv).")
+    from google.colab import files  # type: ignore
+    uploaded = files.upload()
+    for name in uploaded:
+        path = os.path.join(DATA_DIR, name)
+        with open(path, "wb") as f:
+            f.write(uploaded[name])
+    csvs = find_csv()
+
+if not csvs:
+    raise FileNotFoundError(
+        "No CSV found in ./data/. Place your dataset CSV (e.g. Crop_recommendation.csv) there, or run this in Colab to upload it."
+    )
+
+print("Using CSV:", csvs[0])
+
+# --------------------------
+# 1) Load dataset
+# --------------------------
+df = pd.read_csv(csvs[0])
+print("Initial shape:", df.shape)
+display_head = True
+if display_head:
+    print(df.head())
+
+# --------------------------
+# 2) Basic cleaning & label detection
+# --------------------------
+# Remove exact duplicates
+before = df.shape[0]
+df = df.drop_duplicates().reset_index(drop=True)
+print(f"Dropped duplicates: {before - df.shape[0]} rows")
+
+# If there are columns with whitespace-only names, strip them
+df.columns = [c.strip() if isinstance(c, str) else c for c in df.columns]
+
+# Try to detect label column: common names or the non-numeric / low-cardinality column
+label_col = None
+common_label_names = ['label', 'crop', 'crop_name', 'crops', 'target']
+for name in common_label_names:
+    for c in df.columns:
+        if c.lower() == name:
+            label_col = c
+            break
+    if label_col:
+        break
+
+if label_col is None:
+    # choose non-numeric highest-cardinality column likely to be target
+    non_numeric = [c for c in df.columns if df[c].dtype == object]
+    if len(non_numeric) == 1:
+        label_col = non_numeric[0]
+    else:
+        # fallback: choose column with small unique values but object type OR last column
+        candidates = []
+        for c in df.columns:
+            if df[c].dtype == object:
+                candidates.append((c, df[c].nunique()))
+        if candidates:
+            label_col = sorted(candidates, key=lambda x: x[1], reverse=True)[0][0]
+        else:
+            # fallback: last column
+            label_col = df.columns[-1]
+
+print("Detected label column:", label_col)
+
+# Show column list and basic stats
+print("Columns:", df.columns.tolist())
+print(df.describe(include='all').T[['count','unique','top','freq']].head(20))
+
+# --------------------------
+# 3) Missing values handling
+# --------------------------
+total_missing = df.isna().sum().sum()
+print("Total missing values:", total_missing)
+if total_missing > 0:
+    print("Missing per column:\n", df.isna().sum())
+    # Numeric: median, categorical: mode
+    num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    cat_cols = [c for c in df.columns if c not in num_cols]
+    for c in num_cols:
+        df[c] = df[c].fillna(df[c].median())
+    for c in cat_cols:
+        df[c] = df[c].fillna(df[c].mode().iloc[0])
+
+# --------------------------
+# 4) Feature selection: keep numeric features only (common crop dataset)
+# --------------------------
+# If dataset already has columns N,P,K,temperature,humidity,ph,rainfall etc, use them.
+expected_features = ['N','P','K','temperature','humidity','ph','rainfall','moisture','temp','hum']
+# map common alternate column names
+col_map = {c.lower(): c for c in df.columns}
+# pick numeric columns and preserve typical feature names if present
+numeric_features = df.select_dtypes(include=[np.number]).columns.tolist()
+print("Numeric columns found:", numeric_features)
+
+# If numeric_features include target column accidentally, drop it
+if label_col in numeric_features:
+    numeric_features.remove(label_col)
+
+if not numeric_features:
+    raise ValueError("No numeric features found. The model expects numeric input features (N,P,K,temperature,humidity,ph,rainfall...).")
+
+X = df[numeric_features].copy()
+y = df[label_col].astype(str).copy()
+
+print("Using features:", X.columns.tolist())
+print("Number of target classes:", y.nunique())
+
+# --------------------------
+# 5) Encode labels, split data
+# --------------------------
+le = LabelEncoder()
+y_enc = le.fit_transform(y)
+
+# Train-test split (stratified)
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y_enc, test_size=0.20, stratify=y_enc, random_state=42
+)
+print("Train shape:", X_train.shape, "Test shape:", X_test.shape)
+
+# Scale numeric features for models that need it
+scaler = StandardScaler()
+X_train_scaled = scaler.fit_transform(X_train)
+X_test_scaled = scaler.transform(X_test)
+
+# --------------------------
+# 6) Model definitions & baseline evaluation
+# --------------------------
+models = {
+    "RandomForest": RandomForestClassifier(n_estimators=200, random_state=42, n_jobs=-1),
+    "XGBoost": xgb.XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', n_estimators=200, random_state=42, n_jobs=-1),
+    "LightGBM": lgb.LGBMClassifier(n_estimators=200, random_state=42, n_jobs=-1),
+    "SVC": SVC(probability=True, random_state=42),
+    "KNN": KNeighborsClassifier(n_neighbors=7)
+}
+
+def evaluate_model(name, model, X_tr, X_te, y_tr, y_te, do_cv=True):
+    print(f"\n--- {name} ---")
+    model.fit(X_tr, y_tr)
+    y_pred = model.predict(X_te)
+    acc = accuracy_score(y_te, y_pred)
+    print("Accuracy:", acc)
+    print("Classification report:\n", classification_report(y_te, y_pred, target_names=le.classes_))
+    print("Confusion matrix:\n", confusion_matrix(y_te, y_pred))
+    # ROC-AUC (OVR) when possible
+    if hasattr(model, "predict_proba"):
+        try:
+            y_proba = model.predict_proba(X_te)
+            auc = roc_auc_score(pd.get_dummies(y_te), y_proba, average='macro', multi_class='ovr')
+            print("Macro ROC-AUC (OVR):", auc)
+        except Exception as e:
+            print("ROC-AUC calculation failed:", e)
+    if do_cv:
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+        # cross_val_score expects original estimator (will refit in CV)
+        try:
+            scores = cross_val_score(model, np.vstack((X_tr, X_te)), np.hstack((y_tr, y_te)), cv=cv, scoring='accuracy', n_jobs=-1)
+            print("5-fold CV accuracy scores:", np.round(scores, 4))
+            print("CV mean / std:", round(scores.mean(),4), "/", round(scores.std(),4))
+        except Exception as e:
+            print("Cross-val failed:", e)
+    return acc
+
+results = {}
+for name, model in models.items():
+    if name in ['SVC','KNN']:
+        acc = evaluate_model(name, model, X_train_scaled, X_test_scaled, y_train, y_test)
+    else:
+        acc = evaluate_model(name, model, X_train, X_test, y_train, y_test)
+    results[name] = acc
+
+print("\nBaseline results (test accuracy):")
+for k,v in results.items():
+    print(f"{k}: {v:.4f}")
+
+# --------------------------
+# 7) Select best and optional tuning
+# --------------------------
+best_name = max(results.items(), key=lambda kv: kv[1])[0]
+print("Best model by baseline accuracy:", best_name)
+
+# Take best estimator instance from models dict and optionally tune
+best_model = models[best_name]
+
+# Tune only for tree-based models (light tuning to keep runtime reasonable)
+if best_name in ['LightGBM','XGBoost','RandomForest']:
+    print("Running a small GridSearch (this may take a few minutes)...")
+    if best_name == 'LightGBM':
+        param_grid = {
+            'n_estimators': [100, 200],
+            'max_depth': [6, 10],
+            'learning_rate': [0.05, 0.1]
+        }
+    elif best_name == 'XGBoost':
+        param_grid = {
+            'n_estimators': [100, 200],
+            'max_depth': [6, 10],
+            'learning_rate': [0.05, 0.1]
+        }
+    else:  # RandomForest
+        param_grid = {
+            'n_estimators': [100, 200],
+            'max_depth': [10, 14]
+        }
+    cv = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+    grid = GridSearchCV(best_model, param_grid, cv=cv, scoring='accuracy', n_jobs=-1, verbose=1)
+    # Fit on training set only for tuning
+    if best_name in ['SVC','KNN']:
+        grid.fit(X_train_scaled, y_train)
+    else:
+        grid.fit(X_train, y_train)
+    print("Best params:", grid.best_params_)
+    best_model = grid.best_estimator_
+
+# --------------------------
+# 8) Final evaluation on test set
+# --------------------------
+if best_name in ['SVC','KNN']:
+    X_te_for_pred = X_test_scaled
+    X_tr_for_fit = X_train_scaled
+else:
+    X_te_for_pred = X_test.values if hasattr(X_test, 'values') else X_test
+    X_tr_for_fit = X_train.values if hasattr(X_train, 'values') else X_train
+
+best_model.fit(X_tr_for_fit, y_train)
+y_pred = best_model.predict(X_te_for_pred)
+print("\nFinal model evaluation")
+print("Accuracy:", accuracy_score(y_test, y_pred))
+print("Classification report:\n", classification_report(y_test, y_pred, target_names=le.classes_))
+print("Confusion matrix:\n", confusion_matrix(y_test, y_pred))
+
+# Try ROC-AUC
+if hasattr(best_model, "predict_proba"):
+    try:
+        y_proba = best_model.predict_proba(X_te_for_pred)
+        auc = roc_auc_score(pd.get_dummies(y_test), y_proba, average='macro', multi_class='ovr')
+        print("Macro ROC-AUC (OVR):", auc)
+    except Exception as e:
+        print("ROC-AUC calculation failed:", e)
+
+# Save artifacts
+os.makedirs("models", exist_ok=True)
+joblib.dump(best_model, os.path.join("models","best_model.joblib"))
+joblib.dump(le, os.path.join("models","label_encoder.joblib"))
+joblib.dump(scaler, os.path.join("models","scaler.joblib"))
+print("Saved best_model, label_encoder, scaler in ./models/")
+
+# --------------------------
+# 9) Feature importance (if available) + simple plots
+# --------------------------
+try:
+    if hasattr(best_model, "feature_importances_"):
+        fi = best_model.feature_importances_
+        feat_imp = pd.Series(fi, index=X.columns).sort_values(ascending=False)
+        print("\nTop features:\n", feat_imp.head(10))
+        plt.figure(figsize=(8,5))
+        sns.barplot(x=feat_imp.values, y=feat_imp.index)
+        plt.title("Feature importances")
+        plt.tight_layout()
+        plt.show()
+except Exception as e:
+    print("Feature importance not available for this model:", e)
+
+# Confusion matrix heatmap
+cm = confusion_matrix(y_test, y_pred)
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=le.classes_, yticklabels=le.classes_)
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.title("Confusion matrix")
+plt.tight_layout()
+plt.show()
+
+# --------------------------
+# 10) SHAP explainability (optional; may be slow)
+# --------------------------
+try:
+    print("Computing SHAP values (sampled). This can be slow for large models.")
+    # Use TreeExplainer for tree models
+    if hasattr(best_model, "predict_proba") or hasattr(best_model, "feature_importances_"):
+        # use a small sample
+        sample_df = pd.DataFrame(X_train).sample(min(200, len(X_train)), random_state=42)
+        explainer = shap.TreeExplainer(best_model)
+        shap_values = explainer.shap_values(sample_df)
+        # summary plot (matplotlib)
+        shap.summary_plot(shap_values, sample_df, show=True)
+    else:
+        print("SHAP not supported for this model type, or model type is non-tree.")
+except Exception as e:
+    print("SHAP failed or is too slow in this environment:", e)
+
+# --------------------------
+# 11) Helper function: recommend crop for a single sample
+# --------------------------
+def recommend_crop(sample_dict):
+    """
+    sample_dict: mapping of feature name -> value (must contain same features used in training)
+    Example: {'N': 90, 'P': 42, 'K': 43, 'temperature': 20.8, 'humidity': 82.0, 'ph': 6.5, 'rainfall': 200.0}
+    """
+    x = pd.DataFrame([sample_dict])
+    # keep only features used
+    x = x.reindex(columns=X.columns, fill_value=0)
+    if best_name in ['SVC','KNN']:
+        x_proc = scaler.transform(x)
+    else:
+        x_proc = x.values
+    pred_idx = best_model.predict(x_proc)
+    return le.inverse_transform(pred_idx)[0]
+
+# Example usage with medians
+example = {c: float(X[c].median()) for c in X.columns}
+print("Example input (median features):", example)
+print("Recommended crop for median conditions:", recommend_crop(example))
+
+# Save test classification report to CSV
+from sklearn.metrics import classification_report
+report_dict = classification_report(y_test, y_pred, target_names=le.classes_, output_dict=True)
+pd.DataFrame(report_dict).transpose().to_csv("models/test_classification_report.csv")
+print("Saved classification report to models/test_classification_report.csv")
+
+print("All done.")
