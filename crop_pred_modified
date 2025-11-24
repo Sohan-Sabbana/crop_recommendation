@@ -1,0 +1,249 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from sklearn.metrics import (accuracy_score, confusion_matrix, classification_report, 
+                             roc_curve, auc, top_k_accuracy_score, f1_score, precision_score, recall_score)
+from sklearn.linear_model import LogisticRegression
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.naive_bayes import GaussianNB
+import lightgbm as lgb
+from xgboost import XGBClassifier
+import warnings
+from google.colab import files # <--- Library for Colab File Upload
+import io
+
+# Suppress warnings
+warnings.filterwarnings('ignore')
+
+# ==========================================
+# STEP 1: UPLOAD DATASET (COLAB SPECIFIC)
+# ==========================================
+print("\n" + "="*40)
+print(" STEP 1: UPLOAD DATASET ")
+print("="*40)
+print("Please click the 'Choose Files' button below and select 'Crop_recommendation.csv'")
+
+uploaded = files.upload()
+
+try:
+    # This automatically picks the name of the file you uploaded
+    filename = next(iter(uploaded)) 
+    df = pd.read_csv(io.BytesIO(uploaded[filename]))
+    print(f"\n>>> Dataset '{filename}' Loaded Successfully!")
+    print(f"Shape: {df.shape}")
+    print(df.head())
+except StopIteration:
+    print("ERROR: No file uploaded. Please re-run the cell and upload the CSV file.")
+    # Stop execution if no file
+    raise SystemExit("Stopping execution: No file uploaded.")
+
+# ==========================================
+# STEP 2: PREPROCESSING
+# ==========================================
+
+# 1. Separate Features and Target
+# The Kaggle dataset columns are: N, P, K, temperature, humidity, ph, rainfall, label
+X = df.drop('label', axis=1)
+y = df['label']
+
+# 2. Encode Target Labels (Crop Names -> Numbers)
+label_encoder = LabelEncoder()
+y_encoded = label_encoder.fit_transform(y)
+
+# 3. Scaling (CRITICAL for SVM and Logistic Regression)
+scaler = StandardScaler()
+X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=X.columns)
+
+# 4. Train-Test Split (80% Train, 20% Test)
+X_train, X_test, y_train, y_test = train_test_split(X_scaled, y_encoded, test_size=0.2, random_state=42)
+
+# ==========================================
+# STEP 3: TRAIN & COMPARE 6 MODELS
+# ==========================================
+print("\n>>> Training Models on Real Data...")
+
+models = {
+    "Logistic Regression": LogisticRegression(max_iter=2000, random_state=42),
+    "Naive Bayes": GaussianNB(),
+    "Support Vector Machine": SVC(kernel='linear', probability=True, random_state=42),
+    "Decision Tree": DecisionTreeClassifier(random_state=42),
+    "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
+    "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='mlogloss', random_state=42)
+}
+
+results = []
+best_model_name = ""
+best_model_score = 0
+best_model = None
+
+for name, model in models.items():
+    # Train
+    model.fit(X_train, y_train)
+    
+    # Predict
+    y_pred = model.predict(X_test)
+    
+    # Calculate Metrics
+    acc = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred, average='weighted')
+    prec = precision_score(y_test, y_pred, average='weighted')
+    rec = recall_score(y_test, y_pred, average='weighted')
+    
+    results.append({
+        'Model': name,
+        'Accuracy': acc,
+        'F1 Score': f1,
+        'Precision': prec,
+        'Recall': rec
+    })
+    
+    print(f"   -> {name} Done. Accuracy: {acc*100:.2f}%")
+    
+    if acc > best_model_score:
+        best_model_score = acc
+        best_model_name = name
+        best_model = model
+
+# Display Comparison Table
+results_df = pd.DataFrame(results).sort_values(by='Accuracy', ascending=False)
+print("\n" + "="*40)
+print(" MODEL PERFORMANCE LEADERBOARD ")
+print("="*40)
+print(results_df)
+
+print(f"\n>>> BEST MODEL: {best_model_name} with {best_model_score*100:.2f}% Accuracy")
+
+# ==========================================
+# STEP 4: DETAILED EVALUATION (BEST MODEL)
+# ==========================================
+y_prob = best_model.predict_proba(X_test)
+y_pred_final = best_model.predict(X_test)
+
+# Top-3 Accuracy
+top3 = top_k_accuracy_score(y_test, y_prob, k=3)
+
+print(f"\n{'='*30}")
+print(f"DETAILED METRICS ({best_model_name})")
+print(f"{'='*30}")
+print(f"1. Standard Accuracy: {best_model_score*100:.2f}%")
+print(f"2. Top-3 Accuracy:    {top3*100:.2f}% (Reliability)")
+print(f"3. F1 Score:          {results_df.iloc[0]['F1 Score']*100:.2f}%")
+print("-" * 30)
+
+# ==========================================
+# STEP 5: VISUALIZATIONS
+# ==========================================
+
+# 1. Comparison Bar Chart
+plt.figure(figsize=(10, 5))
+sns.barplot(x='Accuracy', y='Model', data=results_df, palette='viridis')
+plt.title('Model Accuracy Comparison')
+plt.xlim(0.9, 1.0) # Zoom in for high accuracy datasets
+plt.show()
+
+# 2. Confusion Matrix
+plt.figure(figsize=(12, 10))
+cm = confusion_matrix(y_test, y_pred_final)
+sns.heatmap(cm, annot=False, cmap='Blues', xticklabels=label_encoder.classes_, yticklabels=label_encoder.classes_)
+plt.title(f'Confusion Matrix: {best_model_name}')
+plt.xlabel('Predicted')
+plt.ylabel('Actual')
+plt.show()
+
+# 3. Feature Importance (Check if model supports it)
+plt.figure(figsize=(10, 6))
+if hasattr(best_model, 'feature_importances_'):
+    # For Trees (RF, XGB, DT)
+    sns.barplot(x=best_model.feature_importances_, y=X.columns, palette='magma')
+    plt.title(f'Feature Importance ({best_model_name})')
+elif hasattr(best_model, 'coef_'):
+    # For SVM (Linear) or Logistic Regression
+    # Take mean absolute value of coefficients
+    avg_importance = np.mean(np.abs(best_model.coef_), axis=0)
+    sns.barplot(x=avg_importance, y=X.columns, palette='magma')
+    plt.title(f'Feature Importance Weights ({best_model_name})')
+plt.show()
+
+# 4. ROC-AUC Curve
+y_test_bin = label_binarize(y_test, classes=np.unique(y_encoded))
+n_classes = y_test_bin.shape[1]
+fpr, tpr, roc_auc = dict(), dict(), dict()
+
+for i in range(n_classes):
+    fpr[i], tpr[i], _ = roc_curve(y_test_bin[:, i], y_prob[:, i])
+    roc_auc[i] = auc(fpr[i], tpr[i])
+
+# Macro Average ROC
+all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+mean_tpr = np.zeros_like(all_fpr)
+for i in range(n_classes):
+    mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+mean_tpr /= n_classes
+
+plt.figure(figsize=(8, 6))
+plt.plot(all_fpr, mean_tpr, label=f'Macro-avg ROC (area = {auc(all_fpr, mean_tpr):.2f})', color='navy', linestyle=':', linewidth=4)
+plt.plot([0, 1], [0, 1], 'k--')
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate')
+plt.title(f'ROC Curve ({best_model_name})')
+plt.legend(loc="lower right")
+plt.show()
+
+# ==========================================
+# STEP 6: FARMER INTERFACE
+# ==========================================
+def predict_new_crop(N, P, K, temperature, humidity, ph, rainfall):
+    # 1. Prepare Input
+    input_data = pd.DataFrame({
+        'N': [N], 'P': [P], 'K': [K], 
+        'temperature': [temperature], 'humidity': [humidity], 
+        'ph': [ph], 'rainfall': [rainfall]
+    })
+    
+    # 2. Scale Input (Using the same scaler as training)
+    input_scaled = scaler.transform(input_data)
+    
+    # 3. Predict Probs
+    probs = best_model.predict_proba(input_scaled)[0]
+    
+    # 4. Get Top 3
+    top_3_idx = np.argsort(probs)[-3:][::-1]
+    top_3_crops = label_encoder.inverse_transform(top_3_idx)
+    top_3_probs = probs[top_3_idx]
+    
+    return top_3_crops, top_3_probs
+
+print("\n" + "#"*40)
+print("   FARMER INPUT SYSTEM   ")
+print("#"*40)
+
+try:
+    # Get user input interactively
+    print("Please enter the following soil details:")
+    u_N = float(input("1. Nitrogen (N)      : "))
+    u_P = float(input("2. Phosphorus (P)    : "))
+    u_K = float(input("3. Potassium (K)     : "))
+    u_T = float(input("4. Temperature (°C)  : "))
+    u_H = float(input("5. Humidity (%)      : "))
+    u_ph = float(input("6. pH Value          : "))
+    u_R = float(input("7. Rainfall (mm)     : "))
+    
+    crops, probs = predict_new_crop(u_N, u_P, u_K, u_T, u_H, u_ph, u_R)
+    
+    print("\n" + "="*40)
+    print("   RECOMMENDATION REPORT   ")
+    print("="*40)
+    print(f"Best Crop to Plant: >> {crops[0]} <<")
+    print(f"Confidence Score:   {probs[0]*100:.2f}%")
+    print("-" * 25)
+    print("Alternative Options (Risk Management):")
+    for c, p in zip(crops[1:], probs[1:]):
+        print(f" - {c}: {p*100:.2f}%")
+        
+except Exception as e:
+    print("Error in input. Please enter valid numbers.", e)
